@@ -324,6 +324,21 @@ def resolve_close_exchange_code(position_exchange_code: object, fallback_exchang
     return fallback_exchange_code
 
 
+def get_closeable_position_qty(position: dict) -> int:
+    """Return the repayable quantity that is not already reserved by another close order."""
+    try:
+        leaves_qty = int(float(position.get("LeavesQty", 0) or 0))
+    except Exception:
+        leaves_qty = 0
+
+    try:
+        hold_qty = int(float(position.get("HoldQty", 0) or 0))
+    except Exception:
+        hold_qty = 0
+
+    return max(0, leaves_qty - max(0, hold_qty))
+
+
 def align_price_to_tse_tick(
     price: float,
     side: str = "",
@@ -853,14 +868,21 @@ class KabuRestApi:
             if self.debug:
                 self.gateway.write_log(f"持仓: {p}")
 
+            closeable_qty = get_closeable_position_qty(p)
             try:
                 leaves = int(float(p.get("LeavesQty", 0) or 0))
             except Exception:
                 leaves = 0
+            try:
+                hold_qty = int(float(p.get("HoldQty", 0) or 0))
+            except Exception:
+                hold_qty = 0
 
-            if leaves <= 0:
+            if closeable_qty <= 0:
                 if self.debug:
-                    self.gateway.write_log(f"跳过: LeavesQty={leaves} <= 0")
+                    self.gateway.write_log(
+                        f"跳过: CloseableQty={closeable_qty} <= 0 (LeavesQty={leaves}, HoldQty={hold_qty})"
+                    )
                 continue
 
             pos_side = str(p.get("Side", ""))
@@ -875,7 +897,9 @@ class KabuRestApi:
                     self.gateway.write_log(f"跳过: ExecutionID={hold_id} 不是E开头")
                 continue
 
-            holds.append(p)
+            hold = dict(p)
+            hold["_closeable_qty"] = closeable_qty
+            holds.append(hold)
 
         if not holds:
             self.gateway.write_log(f"未找到{symbol}的信用建玉可平仓 (需要Side={open_side_needed})")
@@ -927,24 +951,22 @@ class KabuRestApi:
             plist = groups[(close_exchange_code, mt)]
             close_positions = []
             group_qty = 0
+            group_remaining = remaining
 
             for p in plist:
-                if remaining <= 0:
+                if group_remaining <= 0:
                     break
 
                 hold_id = str(p.get("ExecutionID", "") or "")
-                try:
-                    leaves = int(float(p.get("LeavesQty", 0) or 0))
-                except Exception:
-                    leaves = 0
+                closeable_qty = int(p.get("_closeable_qty", 0) or 0)
 
-                if leaves <= 0 or not hold_id:
+                if closeable_qty <= 0 or not hold_id:
                     continue
 
-                take = min(leaves, remaining)
+                take = min(closeable_qty, group_remaining)
                 close_positions.append({"HoldID": hold_id, "Qty": take})
                 group_qty += take
-                remaining -= take
+                group_remaining -= take
 
             if group_qty <= 0:
                 continue
@@ -969,6 +991,8 @@ class KabuRestApi:
             if self.debug:
                 self.gateway.write_log(f"平仓请求: {payload}")
 
+            group_submitted = False
+
             try:
                 resp = self.session.post(f"{self.rest_base}/sendorder", json=payload, timeout=10)
 
@@ -977,6 +1001,7 @@ class KabuRestApi:
                     order_id = data.get("OrderId", "") or data.get("ID", "")
                     if order_id:
                         order_ids.append(order_id)
+                        group_submitted = True
                         # 推送 OrderData（使用分组实际数量，而非原始总量）
                         if req is not None:
                             split_req = copy.copy(req)
@@ -1022,6 +1047,7 @@ class KabuRestApi:
                                 order_id = mkt_data.get("OrderId", "") or mkt_data.get("ID", "")
                                 if order_id:
                                     order_ids.append(order_id)
+                                    group_submitted = True
                                     self.gateway.write_log(f"平仓成行重试成功: order_id={order_id}")
                                     if req is not None:
                                         split_req = copy.copy(req)
@@ -1047,6 +1073,9 @@ class KabuRestApi:
 
             except Exception as e:
                 self.gateway.write_log(f"平仓异常: {e}")
+
+            if group_submitted:
+                remaining -= group_qty
 
         if remaining > 0:
             self.gateway.write_log(f"平仓提示: 需要平{qty}股,实际仅平{qty - remaining}股,剩余{remaining}股")
